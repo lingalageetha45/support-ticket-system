@@ -1,0 +1,2738 @@
+========== PROJECT STRUCTURE ==========
+C:\support-ticket-system\backend\app\main.py
+C:\support-ticket-system\backend\app\seed.py
+C:\support-ticket-system\backend\app\__init__.py
+C:\support-ticket-system\backend\app\api\deps.py
+C:\support-ticket-system\backend\app\api\__init__.py
+C:\support-ticket-system\backend\app\api\v1\attachments.py
+C:\support-ticket-system\backend\app\api\v1\audit.py
+C:\support-ticket-system\backend\app\api\v1\auth.py
+C:\support-ticket-system\backend\app\api\v1\categories.py
+C:\support-ticket-system\backend\app\api\v1\comments.py
+C:\support-ticket-system\backend\app\api\v1\dashboard.py
+C:\support-ticket-system\backend\app\api\v1\notifications.py
+C:\support-ticket-system\backend\app\api\v1\router.py
+C:\support-ticket-system\backend\app\api\v1\tickets.py
+C:\support-ticket-system\backend\app\api\v1\users.py
+C:\support-ticket-system\backend\app\api\v1\__init__.py
+C:\support-ticket-system\backend\app\core\config.py
+C:\support-ticket-system\backend\app\core\database.py
+C:\support-ticket-system\backend\app\core\exceptions.py
+C:\support-ticket-system\backend\app\core\security.py
+C:\support-ticket-system\backend\app\core\__init__.py
+C:\support-ticket-system\backend\app\middleware\__init__.py
+C:\support-ticket-system\backend\app\models\attachment.py
+C:\support-ticket-system\backend\app\models\audit.py
+C:\support-ticket-system\backend\app\models\category.py
+C:\support-ticket-system\backend\app\models\comment.py
+C:\support-ticket-system\backend\app\models\enums.py
+C:\support-ticket-system\backend\app\models\notification.py
+C:\support-ticket-system\backend\app\models\refresh_token.py
+C:\support-ticket-system\backend\app\models\ticket.py
+C:\support-ticket-system\backend\app\models\user.py
+C:\support-ticket-system\backend\app\models\__init__.py
+C:\support-ticket-system\backend\app\repositories\user.py
+C:\support-ticket-system\backend\app\repositories\__init__.py
+C:\support-ticket-system\backend\app\schemas\common.py
+C:\support-ticket-system\backend\app\schemas\ticket.py
+C:\support-ticket-system\backend\app\schemas\user.py
+C:\support-ticket-system\backend\app\schemas\__init__.py
+C:\support-ticket-system\backend\app\services\__init__.py
+C:\support-ticket-system\backend\app\utils\__init__.py
+
+========== FILE CONTENTS ==========
+
+
+========================================
+FILE: .\app\main.py
+========================================
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+import os
+
+from app.core.config import settings
+from app.core.exceptions import AppException
+from app.core.database import engine, Base
+from app.api.v1.router import api_router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+    # Create tables if not using Alembic in dev (Alembic preferred)
+    # Base.metadata.create_all(bind=engine)
+    yield
+    # Shutdown
+
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description="Secure Support Ticket Management System REST API",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(AppException)
+async def app_exception_handler(request: Request, exc: AppException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "error": {"code": exc.code, "message": exc.message},
+        },
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "error": {"code": "HTTP_ERROR", "message": str(exc.detail)},
+        },
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = []
+    for err in exc.errors():
+        loc = " -> ".join(str(l) for l in err.get("loc", []))
+        errors.append(f"{loc}: {err.get('msg')}")
+    return JSONResponse(
+        status_code=422,
+        content={
+            "success": False,
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "; ".join(errors) if errors else "Validation error",
+            },
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error": {
+                "code": "INTERNAL_SERVER_ERROR",
+                "message": "An unexpected error occurred" if not settings.DEBUG else str(exc),
+            },
+        },
+    )
+
+
+app.include_router(api_router, prefix=settings.API_V1_PREFIX)
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "version": settings.APP_VERSION}
+
+
+@app.get("/")
+def root():
+    return {
+        "message": "Support Ticket Management System API",
+        "docs": "/docs",
+        "version": settings.APP_VERSION,
+    }
+
+
+
+========================================
+FILE: .\app\seed.py
+========================================
+"""Seed initial data: admin, agent, categories."""
+from app.core.database import SessionLocal, engine, Base
+from app.core.security import get_password_hash
+from app.models.user import User
+from app.models.category import TicketCategory
+from app.models.enums import UserRole, UserStatus
+
+
+def seed():
+    db = SessionLocal()
+    try:
+        # Admin
+        if not db.query(User).filter(User.email == "admin@support.com").first():
+            admin = User(
+                email="admin@support.com",
+                full_name="System Admin",
+                hashed_password=get_password_hash("Admin@12345"),
+                role=UserRole.ADMIN,
+                status=UserStatus.ACTIVE,
+                is_active=True,
+            )
+            db.add(admin)
+            print("Created admin@support.com / Admin@12345")
+
+        # Agent
+        if not db.query(User).filter(User.email == "agent@support.com").first():
+            agent = User(
+                email="agent@support.com",
+                full_name="Support Agent",
+                hashed_password=get_password_hash("Agent@12345"),
+                role=UserRole.AGENT,
+                status=UserStatus.ACTIVE,
+                is_active=True,
+            )
+            db.add(agent)
+            print("Created agent@support.com / Agent@12345")
+
+        # Customer
+        if not db.query(User).filter(User.email == "customer@example.com").first():
+            customer = User(
+                email="customer@example.com",
+                full_name="Demo Customer",
+                hashed_password=get_password_hash("Customer@12345"),
+                role=UserRole.CUSTOMER,
+                status=UserStatus.ACTIVE,
+                is_active=True,
+            )
+            db.add(customer)
+            print("Created customer@example.com / Customer@12345")
+
+        categories = [
+            ("Technical Support", "Technical issues and troubleshooting"),
+            ("Billing", "Billing and payment related queries"),
+            ("Account", "Account management and access issues"),
+            ("Product Issue", "Product bugs and feature requests"),
+            ("General", "General inquiries"),
+        ]
+        for name, desc in categories:
+            if not db.query(TicketCategory).filter(TicketCategory.name == name).first():
+                db.add(TicketCategory(name=name, description=desc, is_active=True))
+                print(f"Created category: {name}")
+
+        db.commit()
+        print("Seed completed successfully.")
+    except Exception as e:
+        db.rollback()
+        print(f"Seed error: {e}")
+        raise
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    seed()
+
+
+
+========================================
+FILE: .\app\api\deps.py
+========================================
+from typing import Generator, Optional
+from fastapi import Depends, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+from app.core.security import decode_token
+from app.core.exceptions import UnauthorizedException, ForbiddenException
+from app.models.user import User
+from app.models.enums import UserRole, UserStatus
+from app.repositories.user import UserRepository
+
+security = HTTPBearer(auto_error=False)
+
+
+def get_current_user(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    db: Session = Depends(get_db),
+) -> User:
+    if not credentials:
+        raise UnauthorizedException("Authentication required")
+    token = credentials.credentials
+    payload = decode_token(token)
+    if not payload or payload.get("type") != "access":
+        raise UnauthorizedException("Invalid or expired token")
+    user_id = payload.get("sub")
+    if not user_id:
+        raise UnauthorizedException("Invalid token payload")
+    user_repo = UserRepository(db)
+    user = user_repo.get_by_id(int(user_id))
+    if not user:
+        raise UnauthorizedException("User not found")
+    if not user.is_active or user.status != UserStatus.ACTIVE:
+        raise UnauthorizedException("User account is inactive")
+    return user
+
+
+def get_current_active_user(current_user: User = Depends(get_current_user)) -> User:
+    return current_user
+
+
+def require_roles(*roles: UserRole):
+    def role_checker(current_user: User = Depends(get_current_user)) -> User:
+        if current_user.role not in roles:
+            raise ForbiddenException(f"Requires one of roles: {[r.value for r in roles]}")
+        return current_user
+    return role_checker
+
+
+def get_admin_user(current_user: User = Depends(require_roles(UserRole.ADMIN))) -> User:
+    return current_user
+
+
+def get_agent_or_admin(current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.AGENT))) -> User:
+    return current_user
+
+
+def get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+
+========================================
+FILE: .\app\api\v1\router.py
+========================================
+from fastapi import APIRouter
+from app.api.v1 import auth, users, tickets, categories, comments, attachments, notifications, dashboard, audit
+
+api_router = APIRouter()
+
+api_router.include_router(auth.router, prefix="/auth", tags=["Authentication"])
+api_router.include_router(users.router, prefix="/users", tags=["Users"])
+api_router.include_router(categories.router, prefix="/categories", tags=["Categories"])
+api_router.include_router(tickets.router, prefix="/tickets", tags=["Tickets"])
+api_router.include_router(comments.router, prefix="/tickets", tags=["Comments"])
+api_router.include_router(attachments.router, prefix="/tickets", tags=["Attachments"])
+api_router.include_router(notifications.router, prefix="/notifications", tags=["Notifications"])
+api_router.include_router(dashboard.router, prefix="/dashboard", tags=["Dashboard"])
+api_router.include_router(audit.router, prefix="/audit", tags=["Audit Logs"])
+
+
+
+========================================
+FILE: .\app\api\v1\auth.py
+========================================
+from datetime import datetime, timedelta, timezone
+from fastapi import APIRouter, Depends, Request, BackgroundTasks
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+from app.core.security import (
+    verify_password,
+    get_password_hash,
+    create_access_token,
+    create_refresh_token,
+    decode_token,
+)
+from app.core.config import settings
+from app.core.exceptions import (
+    UnauthorizedException,
+    ConflictException,
+    ForbiddenException,
+    NotFoundException,
+    ValidationException,
+)
+from app.api.deps import get_current_user, get_client_ip
+from app.models.user import User
+from app.models.refresh_token import RefreshToken
+from app.models.enums import UserRole, UserStatus
+from app.models.audit import AuditLog
+from app.schemas.user import (
+    UserRegister,
+    UserLogin,
+    UserOut,
+    Token,
+    TokenRefresh,
+    UserChangePassword,
+)
+from app.schemas.common import ResponseModel
+from app.repositories.user import UserRepository
+
+router = APIRouter()
+
+
+def create_audit(db: Session, user_id: int | None, action: str, entity: str, entity_id: int | None, ip: str, metadata: dict | None = None):
+    log = AuditLog(
+        user_id=user_id,
+        action=action,
+        entity=entity,
+        entity_id=entity_id,
+        ip_address=ip,
+        metadata_=metadata,
+    )
+    db.add(log)
+    db.commit()
+
+
+@router.post("/register", response_model=ResponseModel[UserOut], status_code=201)
+def register(
+    data: UserRegister,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    repo = UserRepository(db)
+    if repo.get_by_email(data.email):
+        raise ConflictException("Email already registered", code="DUPLICATE_EMAIL")
+    user = User(
+        email=data.email.lower(),
+        full_name=data.full_name,
+        hashed_password=get_password_hash(data.password),
+        role=UserRole.CUSTOMER,
+        status=UserStatus.ACTIVE,
+        is_active=True,
+    )
+    user = repo.create(user)
+    create_audit(db, user.id, "USER_REGISTERED", "user", user.id, get_client_ip(request))
+    return ResponseModel(data=UserOut.model_validate(user), message="Registration successful")
+
+
+@router.post("/login", response_model=ResponseModel[Token])
+def login(
+    data: UserLogin,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    repo = UserRepository(db)
+    user = repo.get_by_email(data.email)
+    ip = get_client_ip(request)
+    if not user or not verify_password(data.password, user.hashed_password):
+        create_audit(db, None, "LOGIN_FAILED", "user", None, ip, {"email": data.email})
+        raise UnauthorizedException("Invalid email or password", code="INVALID_CREDENTIALS")
+    if not user.is_active or user.status != UserStatus.ACTIVE:
+        create_audit(db, user.id, "LOGIN_FAILED_INACTIVE", "user", user.id, ip)
+        raise UnauthorizedException("Account is inactive", code="INACTIVE_USER")
+    access = create_access_token(user.id, extra_claims={"role": user.role.value})
+    refresh = create_refresh_token(user.id)
+    expires = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    rt = RefreshToken(user_id=user.id, token=refresh, expires_at=expires)
+    db.add(rt)
+    db.commit()
+    create_audit(db, user.id, "LOGIN_SUCCESS", "user", user.id, ip)
+    return ResponseModel(
+        data=Token(access_token=access, refresh_token=refresh),
+        message="Login successful",
+    )
+
+
+@router.post("/refresh", response_model=ResponseModel[Token])
+def refresh_token(data: TokenRefresh, db: Session = Depends(get_db)):
+    payload = decode_token(data.refresh_token)
+    if not payload or payload.get("type") != "refresh":
+        raise UnauthorizedException("Invalid refresh token")
+    user_id = int(payload["sub"])
+    rt = (
+        db.query(RefreshToken)
+        .filter(
+            RefreshToken.token == data.refresh_token,
+            RefreshToken.user_id == user_id,
+            RefreshToken.is_revoked == False,
+        )
+        .first()
+    )
+    if not rt or rt.expires_at < datetime.now(timezone.utc):
+        raise UnauthorizedException("Refresh token expired or revoked")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or not user.is_active or user.status != UserStatus.ACTIVE:
+        raise UnauthorizedException("User inactive")
+    access = create_access_token(user.id, extra_claims={"role": user.role.value})
+    new_refresh = create_refresh_token(user.id)
+    rt.is_revoked = True
+    new_rt = RefreshToken(
+        user_id=user.id,
+        token=new_refresh,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+    db.add(new_rt)
+    db.commit()
+    return ResponseModel(data=Token(access_token=access, refresh_token=new_refresh))
+
+
+@router.post("/logout", response_model=ResponseModel)
+def logout(
+    data: TokenRefresh,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rt = (
+        db.query(RefreshToken)
+        .filter(RefreshToken.token == data.refresh_token, RefreshToken.user_id == current_user.id)
+        .first()
+    )
+    if rt:
+        rt.is_revoked = True
+        db.commit()
+    return ResponseModel(message="Logged out successfully")
+
+
+@router.get("/me", response_model=ResponseModel[UserOut])
+def me(current_user: User = Depends(get_current_user)):
+    return ResponseModel(data=UserOut.model_validate(current_user))
+
+
+@router.post("/change-password", response_model=ResponseModel)
+def change_password(
+    data: UserChangePassword,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not verify_password(data.current_password, current_user.hashed_password):
+        raise ValidationException("Current password is incorrect")
+    current_user.hashed_password = get_password_hash(data.new_password)
+    db.commit()
+    return ResponseModel(message="Password changed successfully")
+
+
+
+========================================
+FILE: .\app\api\v1\users.py
+========================================
+from typing import Optional
+from fastapi import APIRouter, Depends, Query, Request
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+from app.core.security import get_password_hash
+from app.core.exceptions import NotFoundException, ConflictException, ForbiddenException
+from app.api.deps import get_admin_user, get_current_user, get_client_ip
+from app.models.user import User
+from app.models.enums import UserRole, UserStatus
+from app.models.audit import AuditLog
+from app.schemas.user import UserCreate, UserUpdate, UserOut
+from app.schemas.common import ResponseModel, PaginatedResponse, PaginationMeta
+from app.repositories.user import UserRepository
+
+router = APIRouter()
+
+
+def audit(db, user_id, action, entity, entity_id, ip, meta=None):
+    db.add(AuditLog(user_id=user_id, action=action, entity=entity, entity_id=entity_id, ip_address=ip, metadata_=meta))
+    db.commit()
+
+
+@router.post("", response_model=ResponseModel[UserOut], status_code=201)
+def create_user(
+    data: UserCreate,
+    request: Request,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    repo = UserRepository(db)
+    if repo.get_by_email(data.email):
+        raise ConflictException("Email already exists", code="DUPLICATE_EMAIL")
+    user = User(
+        email=data.email.lower(),
+        full_name=data.full_name,
+        hashed_password=get_password_hash(data.password),
+        role=data.role,
+        status=UserStatus.ACTIVE,
+        is_active=True,
+    )
+    user = repo.create(user)
+    audit(db, admin.id, "USER_CREATED", "user", user.id, get_client_ip(request), {"role": user.role.value})
+    return ResponseModel(data=UserOut.model_validate(user), message="User created")
+
+
+@router.get("", response_model=PaginatedResponse[UserOut])
+def list_users(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    role: Optional[UserRole] = None,
+    status: Optional[UserStatus] = None,
+    search: Optional[str] = None,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    repo = UserRepository(db)
+    skip = (page - 1) * page_size
+    users, total = repo.list_users(skip=skip, limit=page_size, role=role, status=status, search=search)
+    return PaginatedResponse(
+        data=[UserOut.model_validate(u) for u in users],
+        meta=PaginationMeta(page=page, page_size=page_size, total=total, total_pages=(total + page_size - 1) // page_size),
+    )
+
+
+@router.get("/{user_id}", response_model=ResponseModel[UserOut])
+def get_user(user_id: int, admin: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+    user = UserRepository(db).get_by_id(user_id)
+    if not user:
+        raise NotFoundException("User not found")
+    return ResponseModel(data=UserOut.model_validate(user))
+
+
+@router.patch("/{user_id}", response_model=ResponseModel[UserOut])
+def update_user(
+    user_id: int,
+    data: UserUpdate,
+    request: Request,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    repo = UserRepository(db)
+    user = repo.get_by_id(user_id)
+    if not user:
+        raise NotFoundException("User not found")
+    if data.email and data.email.lower() != user.email:
+        if repo.get_by_email(data.email):
+            raise ConflictException("Email already exists")
+        user.email = data.email.lower()
+    if data.full_name is not None:
+        user.full_name = data.full_name
+    if data.role is not None:
+        user.role = data.role
+    if data.status is not None:
+        user.status = data.status
+        user.is_active = data.status == UserStatus.ACTIVE
+    repo.update(user)
+    audit(db, admin.id, "USER_UPDATED", "user", user.id, get_client_ip(request))
+    return ResponseModel(data=UserOut.model_validate(user), message="User updated")
+
+
+@router.post("/{user_id}/activate", response_model=ResponseModel[UserOut])
+def activate_user(user_id: int, request: Request, admin: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+    user = UserRepository(db).get_by_id(user_id)
+    if not user:
+        raise NotFoundException("User not found")
+    user.status = UserStatus.ACTIVE
+    user.is_active = True
+    db.commit()
+    db.refresh(user)
+    audit(db, admin.id, "USER_ACTIVATED", "user", user.id, get_client_ip(request))
+    return ResponseModel(data=UserOut.model_validate(user), message="User activated")
+
+
+@router.post("/{user_id}/deactivate", response_model=ResponseModel[UserOut])
+def deactivate_user(user_id: int, request: Request, admin: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+    user = UserRepository(db).get_by_id(user_id)
+    if not user:
+        raise NotFoundException("User not found")
+    if user.id == admin.id:
+        raise ForbiddenException("Cannot deactivate yourself")
+    user.status = UserStatus.INACTIVE
+    user.is_active = False
+    db.commit()
+    db.refresh(user)
+    audit(db, admin.id, "USER_DEACTIVATED", "user", user.id, get_client_ip(request))
+    return ResponseModel(data=UserOut.model_validate(user), message="User deactivated")
+
+
+@router.post("/{user_id}/change-role", response_model=ResponseModel[UserOut])
+def change_role(
+    user_id: int,
+    role: UserRole,
+    request: Request,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    user = UserRepository(db).get_by_id(user_id)
+    if not user:
+        raise NotFoundException("User not found")
+    user.role = role
+    db.commit()
+    db.refresh(user)
+    audit(db, admin.id, "USER_ROLE_CHANGED", "user", user.id, get_client_ip(request), {"new_role": role.value})
+    return ResponseModel(data=UserOut.model_validate(user), message="Role updated")
+
+
+
+========================================
+FILE: .\app\api\v1\tickets.py
+========================================
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+from fastapi import APIRouter, Depends, Query, Request, BackgroundTasks
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import or_, and_
+from app.core.database import get_db
+from app.core.exceptions import (
+    NotFoundException,
+    ForbiddenException,
+    InvalidStatusTransition,
+    ValidationException,
+)
+from app.api.deps import get_current_user, get_agent_or_admin, get_admin_user, get_client_ip
+from app.models.user import User
+from app.models.ticket import Ticket, TicketStatusHistory
+from app.models.category import TicketCategory
+from app.models.enums import (
+    UserRole,
+    UserStatus,
+    TicketStatus,
+    TicketPriority,
+    STATUS_TRANSITIONS,
+    SLA_HOURS,
+)
+from app.models.notification import Notification, NotificationType
+from app.models.audit import AuditLog
+from app.schemas.ticket import (
+    TicketCreate,
+    TicketUpdate,
+    TicketAssign,
+    TicketStatusUpdate,
+    TicketOut,
+    TicketListOut,
+)
+from app.schemas.common import ResponseModel, PaginatedResponse, PaginationMeta
+
+router = APIRouter()
+
+
+def generate_ticket_number(db: Session) -> str:
+    last = db.query(Ticket).order_by(Ticket.id.desc()).first()
+    next_id = (last.id + 1) if last else 1
+    return f"TKT-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{next_id:05d}"
+
+
+def calculate_due_date(priority: TicketPriority) -> datetime:
+    hours = SLA_HOURS.get(priority, 48)
+    return datetime.now(timezone.utc) + timedelta(hours=hours)
+
+
+def create_notification(db: Session, user_id: int, ticket_id: int, ntype: NotificationType, title: str, message: str):
+    n = Notification(user_id=user_id, ticket_id=ticket_id, type=ntype, title=title, message=message)
+    db.add(n)
+
+
+def audit(db, user_id, action, entity, entity_id, ip, meta=None):
+    db.add(AuditLog(user_id=user_id, action=action, entity=entity, entity_id=entity_id, ip_address=ip, metadata_=meta))
+
+
+def can_access_ticket(user: User, ticket: Ticket) -> bool:
+    if user.role == UserRole.ADMIN:
+        return True
+    if user.role == UserRole.AGENT:
+        return ticket.assigned_agent_id == user.id or ticket.assigned_agent_id is None
+    return ticket.customer_id == user.id
+
+
+@router.post("", response_model=ResponseModel[TicketOut], status_code=201)
+def create_ticket(
+    data: TicketCreate,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    cat = db.query(TicketCategory).filter(TicketCategory.id == data.category_id, TicketCategory.is_active == True).first()
+    if not cat:
+        raise ValidationException("Invalid or inactive category")
+    ticket = Ticket(
+        ticket_number=generate_ticket_number(db),
+        title=data.title,
+        description=data.description,
+        status=TicketStatus.OPEN,
+        priority=data.priority,
+        customer_id=current_user.id,
+        category_id=data.category_id,
+        due_date=calculate_due_date(data.priority),
+    )
+    db.add(ticket)
+    db.flush()
+    history = TicketStatusHistory(
+        ticket_id=ticket.id,
+        old_status=None,
+        new_status=TicketStatus.OPEN,
+        changed_by_id=current_user.id,
+        note="Ticket created",
+    )
+    db.add(history)
+    create_notification(
+        db, current_user.id, ticket.id, NotificationType.TICKET_CREATED,
+        "Ticket Created", f"Your ticket {ticket.ticket_number} has been created."
+    )
+    audit(db, current_user.id, "TICKET_CREATED", "ticket", ticket.id, get_client_ip(request))
+    db.commit()
+    db.refresh(ticket)
+    return ResponseModel(data=TicketOut.model_validate(ticket), message="Ticket created")
+
+
+@router.get("", response_model=PaginatedResponse[TicketListOut])
+def list_tickets(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    status: Optional[TicketStatus] = None,
+    priority: Optional[TicketPriority] = None,
+    category_id: Optional[int] = None,
+    assigned_agent_id: Optional[int] = None,
+    customer_id: Optional[int] = None,
+    search: Optional[str] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    sort_by: str = Query("created_at", pattern="^(created_at|updated_at|due_date|priority|status)$"),
+    sort_order: str = Query("desc", pattern="^(asc|desc)$"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(Ticket)
+    # Authorization scope
+    if current_user.role == UserRole.CUSTOMER:
+        q = q.filter(Ticket.customer_id == current_user.id)
+    elif current_user.role == UserRole.AGENT:
+        q = q.filter(or_(Ticket.assigned_agent_id == current_user.id, Ticket.assigned_agent_id.is_(None)))
+    # Filters
+    if status:
+        q = q.filter(Ticket.status == status)
+    if priority:
+        q = q.filter(Ticket.priority == priority)
+    if category_id:
+        q = q.filter(Ticket.category_id == category_id)
+    if assigned_agent_id:
+        q = q.filter(Ticket.assigned_agent_id == assigned_agent_id)
+    if customer_id and current_user.role == UserRole.ADMIN:
+        q = q.filter(Ticket.customer_id == customer_id)
+    if search:
+        like = f"%{search}%"
+        q = q.filter(or_(Ticket.title.ilike(like), Ticket.description.ilike(like), Ticket.ticket_number.ilike(like)))
+    if date_from:
+        q = q.filter(Ticket.created_at >= date_from)
+    if date_to:
+        q = q.filter(Ticket.created_at <= date_to)
+    total = q.count()
+    col = getattr(Ticket, sort_by, Ticket.created_at)
+    q = q.order_by(col.desc() if sort_order == "desc" else col.asc())
+    tickets = q.offset((page - 1) * page_size).limit(page_size).all()
+    return PaginatedResponse(
+        data=[TicketListOut.model_validate(t) for t in tickets],
+        meta=PaginationMeta(page=page, page_size=page_size, total=total, total_pages=(total + page_size - 1) // page_size or 1),
+    )
+
+
+@router.get("/{ticket_id}", response_model=ResponseModel[TicketOut])
+def get_ticket(ticket_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    ticket = (
+        db.query(Ticket)
+        .options(joinedload(Ticket.customer), joinedload(Ticket.assigned_agent), joinedload(Ticket.category))
+        .filter(Ticket.id == ticket_id)
+        .first()
+    )
+    if not ticket:
+        raise NotFoundException("Ticket not found")
+    if not can_access_ticket(current_user, ticket):
+        raise ForbiddenException("You do not have access to this ticket")
+    return ResponseModel(data=TicketOut.model_validate(ticket))
+
+
+@router.patch("/{ticket_id}", response_model=ResponseModel[TicketOut])
+def update_ticket(
+    ticket_id: int,
+    data: TicketUpdate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    if not ticket:
+        raise NotFoundException("Ticket not found")
+    if not can_access_ticket(current_user, ticket):
+        raise ForbiddenException("Access denied")
+    if ticket.status == TicketStatus.CLOSED and current_user.role != UserRole.ADMIN:
+        raise ForbiddenException("Closed tickets cannot be modified")
+    if data.title is not None:
+        ticket.title = data.title
+    if data.description is not None:
+        ticket.description = data.description
+    if data.category_id is not None:
+        cat = db.query(TicketCategory).filter(TicketCategory.id == data.category_id, TicketCategory.is_active == True).first()
+        if not cat:
+            raise ValidationException("Invalid or inactive category")
+        ticket.category_id = data.category_id
+    if data.priority is not None and data.priority != ticket.priority:
+        ticket.priority = data.priority
+        ticket.due_date = calculate_due_date(data.priority)
+    if data.status is not None and data.status != ticket.status:
+        allowed = STATUS_TRANSITIONS.get(ticket.status, [])
+        if data.status not in allowed:
+            raise InvalidStatusTransition(
+                f"Cannot transition from {ticket.status.value} to {data.status.value}"
+            )
+        old = ticket.status
+        ticket.status = data.status
+        if data.status == TicketStatus.RESOLVED:
+            ticket.resolved_at = datetime.now(timezone.utc)
+        if data.status == TicketStatus.CLOSED:
+            ticket.closed_at = datetime.now(timezone.utc)
+        db.add(TicketStatusHistory(
+            ticket_id=ticket.id, old_status=old, new_status=data.status,
+            changed_by_id=current_user.id, note="Status updated via ticket update"
+        ))
+        create_notification(
+            db, ticket.customer_id, ticket.id, NotificationType.TICKET_STATUS_CHANGED,
+            "Status Updated", f"Ticket {ticket.ticket_number} is now {data.status.value}"
+        )
+        if ticket.assigned_agent_id:
+            create_notification(
+                db, ticket.assigned_agent_id, ticket.id, NotificationType.TICKET_STATUS_CHANGED,
+                "Status Updated", f"Ticket {ticket.ticket_number} is now {data.status.value}"
+            )
+    db.commit()
+    db.refresh(ticket)
+    audit(db, current_user.id, "TICKET_UPDATED", "ticket", ticket.id, get_client_ip(request))
+    return ResponseModel(data=TicketOut.model_validate(ticket), message="Ticket updated")
+
+
+@router.post("/{ticket_id}/assign", response_model=ResponseModel[TicketOut])
+def assign_ticket(
+    ticket_id: int,
+    data: TicketAssign,
+    request: Request,
+    current_user: User = Depends(get_agent_or_admin),
+    db: Session = Depends(get_db),
+):
+    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    if not ticket:
+        raise NotFoundException("Ticket not found")
+    agent = db.query(User).filter(User.id == data.agent_id, User.role == UserRole.AGENT).first()
+    if not agent:
+        raise ValidationException("Invalid agent")
+    if not agent.is_active or agent.status != UserStatus.ACTIVE:
+        raise ValidationException("Cannot assign to inactive agent", code="INACTIVE_AGENT")
+    old_agent = ticket.assigned_agent_id
+    ticket.assigned_agent_id = agent.id
+    if ticket.status == TicketStatus.OPEN:
+        ticket.status = TicketStatus.IN_PROGRESS
+        db.add(TicketStatusHistory(
+            ticket_id=ticket.id, old_status=TicketStatus.OPEN, new_status=TicketStatus.IN_PROGRESS,
+            changed_by_id=current_user.id, note=f"Assigned to {agent.full_name}"
+        ))
+    ntype = NotificationType.TICKET_REASSIGNED if old_agent else NotificationType.TICKET_ASSIGNED
+    create_notification(
+        db, agent.id, ticket.id, ntype,
+        "Ticket Assigned", f"You have been assigned ticket {ticket.ticket_number}"
+    )
+    create_notification(
+        db, ticket.customer_id, ticket.id, ntype,
+        "Ticket Assigned", f"Your ticket {ticket.ticket_number} has been assigned to an agent"
+    )
+    audit(db, current_user.id, "TICKET_ASSIGNED", "ticket", ticket.id, get_client_ip(request), {"agent_id": agent.id})
+    db.commit()
+    db.refresh(ticket)
+    return ResponseModel(data=TicketOut.model_validate(ticket), message="Ticket assigned")
+
+
+@router.post("/{ticket_id}/status", response_model=ResponseModel[TicketOut])
+def change_status(
+    ticket_id: int,
+    data: TicketStatusUpdate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    if not ticket:
+        raise NotFoundException("Ticket not found")
+    if not can_access_ticket(current_user, ticket):
+        raise ForbiddenException("Access denied")
+    allowed = STATUS_TRANSITIONS.get(ticket.status, [])
+    if data.status not in allowed:
+        raise InvalidStatusTransition(
+            f"Cannot transition from {ticket.status.value} to {data.status.value}"
+        )
+    old = ticket.status
+    ticket.status = data.status
+    if data.status == TicketStatus.RESOLVED:
+        ticket.resolved_at = datetime.now(timezone.utc)
+        create_notification(db, ticket.customer_id, ticket.id, NotificationType.TICKET_RESOLVED, "Ticket Resolved", f"Ticket {ticket.ticket_number} has been resolved")
+    if data.status == TicketStatus.CLOSED:
+        ticket.closed_at = datetime.now(timezone.utc)
+        create_notification(db, ticket.customer_id, ticket.id, NotificationType.TICKET_CLOSED, "Ticket Closed", f"Ticket {ticket.ticket_number} has been closed")
+    db.add(TicketStatusHistory(
+        ticket_id=ticket.id, old_status=old, new_status=data.status,
+        changed_by_id=current_user.id, note=data.note
+    ))
+    create_notification(
+        db, ticket.customer_id, ticket.id, NotificationType.TICKET_STATUS_CHANGED,
+        "Status Changed", f"Ticket {ticket.ticket_number} is now {data.status.value}"
+    )
+    if ticket.assigned_agent_id and ticket.assigned_agent_id != current_user.id:
+        create_notification(
+            db, ticket.assigned_agent_id, ticket.id, NotificationType.TICKET_STATUS_CHANGED,
+            "Status Changed", f"Ticket {ticket.ticket_number} is now {data.status.value}"
+        )
+    audit(db, current_user.id, "STATUS_CHANGED", "ticket", ticket.id, get_client_ip(request), {"from": old.value, "to": data.status.value})
+    db.commit()
+    db.refresh(ticket)
+    return ResponseModel(data=TicketOut.model_validate(ticket), message="Status updated")
+
+
+@router.delete("/{ticket_id}", response_model=ResponseModel)
+def delete_ticket(
+    ticket_id: int,
+    request: Request,
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    if not ticket:
+        raise NotFoundException("Ticket not found")
+    db.delete(ticket)
+    audit(db, current_user.id, "TICKET_DELETED", "ticket", ticket_id, get_client_ip(request))
+    db.commit()
+    return ResponseModel(message="Ticket deleted")
+
+
+
+========================================
+FILE: .\app\api\v1\comments.py
+========================================
+from fastapi import APIRouter, Depends, Request
+from sqlalchemy.orm import Session, joinedload
+from app.core.database import get_db
+from app.core.exceptions import NotFoundException, ForbiddenException, ValidationException
+from app.api.deps import get_current_user, get_client_ip
+from app.models.user import User
+from app.models.ticket import Ticket
+from app.models.comment import TicketComment
+from app.models.enums import UserRole, TicketStatus
+from app.models.notification import Notification, NotificationType
+from app.models.audit import AuditLog
+from app.schemas.ticket import CommentCreate, CommentUpdate, CommentOut
+from app.schemas.common import ResponseModel
+
+router = APIRouter()
+
+
+@router.post("/{ticket_id}/comments", response_model=ResponseModel[CommentOut], status_code=201)
+def add_comment(
+    ticket_id: int,
+    data: CommentCreate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    if not ticket:
+        raise NotFoundException("Ticket not found")
+    # Access check
+    if current_user.role == UserRole.CUSTOMER and ticket.customer_id != current_user.id:
+        raise ForbiddenException("Access denied")
+    if ticket.status == TicketStatus.CLOSED:
+        raise ValidationException("Cannot comment on closed tickets. Please reopen first.")
+    if data.is_internal and current_user.role == UserRole.CUSTOMER:
+        raise ForbiddenException("Customers cannot create internal comments")
+    comment = TicketComment(
+        ticket_id=ticket_id,
+        user_id=current_user.id,
+        message=data.message,
+        is_internal=data.is_internal,
+    )
+    db.add(comment)
+    # Notify
+    recipients = set()
+    if ticket.customer_id != current_user.id:
+        recipients.add(ticket.customer_id)
+    if ticket.assigned_agent_id and ticket.assigned_agent_id != current_user.id:
+        recipients.add(ticket.assigned_agent_id)
+    for uid in recipients:
+        if data.is_internal and uid == ticket.customer_id:
+            continue  # don't notify customer of internal notes
+        n = Notification(
+            user_id=uid, ticket_id=ticket_id, type=NotificationType.NEW_COMMENT,
+            title="New Comment", message=f"New comment on ticket {ticket.ticket_number}"
+        )
+        db.add(n)
+    db.add(AuditLog(user_id=current_user.id, action="COMMENT_ADDED", entity="comment", entity_id=None, ip_address=get_client_ip(request)))
+    db.commit()
+    db.refresh(comment)
+    return ResponseModel(data=CommentOut.model_validate(comment), message="Comment added")
+
+
+@router.get("/{ticket_id}/comments", response_model=ResponseModel[list[CommentOut]])
+def list_comments(ticket_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    if not ticket:
+        raise NotFoundException("Ticket not found")
+    if current_user.role == UserRole.CUSTOMER and ticket.customer_id != current_user.id:
+        raise ForbiddenException("Access denied")
+    q = db.query(TicketComment).options(joinedload(TicketComment.user)).filter(TicketComment.ticket_id == ticket_id)
+    if current_user.role == UserRole.CUSTOMER:
+        q = q.filter(TicketComment.is_internal == False)
+    comments = q.order_by(TicketComment.created_at.asc()).all()
+    return ResponseModel(data=[CommentOut.model_validate(c) for c in comments])
+
+
+@router.patch("/{ticket_id}/comments/{comment_id}", response_model=ResponseModel[CommentOut])
+def update_comment(
+    ticket_id: int,
+    comment_id: int,
+    data: CommentUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    comment = db.query(TicketComment).filter(TicketComment.id == comment_id, TicketComment.ticket_id == ticket_id).first()
+    if not comment:
+        raise NotFoundException("Comment not found")
+    if current_user.role != UserRole.ADMIN and comment.user_id != current_user.id:
+        raise ForbiddenException("You can only edit your own comments")
+    comment.message = data.message
+    db.commit()
+    db.refresh(comment)
+    return ResponseModel(data=CommentOut.model_validate(comment), message="Comment updated")
+
+
+@router.delete("/{ticket_id}/comments/{comment_id}", response_model=ResponseModel)
+def delete_comment(
+    ticket_id: int,
+    comment_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    comment = db.query(TicketComment).filter(TicketComment.id == comment_id, TicketComment.ticket_id == ticket_id).first()
+    if not comment:
+        raise NotFoundException("Comment not found")
+    if current_user.role != UserRole.ADMIN and comment.user_id != current_user.id:
+        raise ForbiddenException("You can only delete your own comments")
+    db.delete(comment)
+    db.commit()
+    return ResponseModel(message="Comment deleted")
+
+
+
+========================================
+FILE: .\app\api\v1\attachments.py
+========================================
+import os
+import uuid
+import mimetypes
+from fastapi import APIRouter, Depends, UploadFile, File, Request
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+from app.core.config import settings
+from app.core.exceptions import NotFoundException, ForbiddenException, ValidationException
+from app.api.deps import get_current_user, get_client_ip
+from app.models.user import User
+from app.models.ticket import Ticket
+from app.models.attachment import TicketAttachment
+from app.models.enums import UserRole
+from app.models.audit import AuditLog
+from app.schemas.ticket import AttachmentOut
+from app.schemas.common import ResponseModel
+
+router = APIRouter()
+
+
+def validate_file(file: UploadFile, content: bytes) -> tuple[str, str]:
+    # Size
+    if len(content) > settings.max_upload_size_bytes:
+        raise ValidationException(f"File exceeds maximum size of {settings.MAX_UPLOAD_SIZE_MB}MB")
+    # Extension
+    ext = (file.filename or "").rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else ""
+    if ext not in settings.allowed_extensions_list:
+        raise ValidationException(f"File extension '{ext}' not allowed")
+    # MIME (prefer content-type but also guess)
+    content_type = (file.content_type or "").lower()
+    guessed, _ = mimetypes.guess_type(file.filename or "")
+    if content_type not in settings.allowed_mime_types_list and (guessed or "") not in settings.allowed_mime_types_list:
+        # allow if extension is ok and content_type is common
+        if content_type not in ("application/octet-stream",):
+            raise ValidationException(f"MIME type '{content_type}' not allowed")
+    return ext, content_type or (guessed or "application/octet-stream")
+
+
+@router.post("/{ticket_id}/attachments", response_model=ResponseModel[AttachmentOut], status_code=201)
+async def upload_attachment(
+    ticket_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    if not ticket:
+        raise NotFoundException("Ticket not found")
+    if current_user.role == UserRole.CUSTOMER and ticket.customer_id != current_user.id:
+        raise ForbiddenException("Access denied")
+    content = await file.read()
+    ext, mime = validate_file(file, content)
+    stored_name = f"{uuid.uuid4().hex}.{ext}"
+    path = os.path.join(settings.UPLOAD_DIR, stored_name)
+    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(content)
+    att = TicketAttachment(
+        ticket_id=ticket_id,
+        uploaded_by_id=current_user.id,
+        file_name=stored_name,
+        original_name=file.filename or stored_name,
+        file_type=ext,
+        mime_type=mime,
+        file_size=len(content),
+        storage_path=path,
+    )
+    db.add(att)
+    db.add(AuditLog(user_id=current_user.id, action="ATTACHMENT_UPLOADED", entity="attachment", entity_id=None, ip_address=get_client_ip(request)))
+    db.commit()
+    db.refresh(att)
+    return ResponseModel(data=AttachmentOut.model_validate(att), message="Attachment uploaded")
+
+
+@router.get("/{ticket_id}/attachments", response_model=ResponseModel[list[AttachmentOut]])
+def list_attachments(ticket_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    if not ticket:
+        raise NotFoundException("Ticket not found")
+    if current_user.role == UserRole.CUSTOMER and ticket.customer_id != current_user.id:
+        raise ForbiddenException("Access denied")
+    atts = db.query(TicketAttachment).filter(TicketAttachment.ticket_id == ticket_id).all()
+    return ResponseModel(data=[AttachmentOut.model_validate(a) for a in atts])
+
+
+@router.get("/{ticket_id}/attachments/{attachment_id}/download")
+def download_attachment(
+    ticket_id: int,
+    attachment_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    att = db.query(TicketAttachment).filter(
+        TicketAttachment.id == attachment_id, TicketAttachment.ticket_id == ticket_id
+    ).first()
+    if not att:
+        raise NotFoundException("Attachment not found")
+    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    if current_user.role == UserRole.CUSTOMER and ticket.customer_id != current_user.id:
+        raise ForbiddenException("Access denied")
+    if not os.path.exists(att.storage_path):
+        raise NotFoundException("File not found on storage")
+    return FileResponse(att.storage_path, filename=att.original_name, media_type=att.mime_type)
+
+
+@router.delete("/{ticket_id}/attachments/{attachment_id}", response_model=ResponseModel)
+def delete_attachment(
+    ticket_id: int,
+    attachment_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    att = db.query(TicketAttachment).filter(
+        TicketAttachment.id == attachment_id, TicketAttachment.ticket_id == ticket_id
+    ).first()
+    if not att:
+        raise NotFoundException("Attachment not found")
+    if current_user.role != UserRole.ADMIN and att.uploaded_by_id != current_user.id:
+        raise ForbiddenException("You can only delete your own attachments")
+    if os.path.exists(att.storage_path):
+        os.remove(att.storage_path)
+    db.delete(att)
+    db.commit()
+    return ResponseModel(message="Attachment deleted")
+
+
+
+========================================
+FILE: .\app\api\v1\categories.py
+========================================
+from fastapi import APIRouter, Depends, Request
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+from app.core.exceptions import NotFoundException, ConflictException
+from app.api.deps import get_admin_user, get_current_user
+from app.models.user import User
+from app.models.category import TicketCategory
+from app.schemas.ticket import CategoryCreate, CategoryUpdate, CategoryOut
+from app.schemas.common import ResponseModel
+
+router = APIRouter()
+
+
+@router.post("", response_model=ResponseModel[CategoryOut], status_code=201)
+def create_category(data: CategoryCreate, admin: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+    exists = db.query(TicketCategory).filter(TicketCategory.name == data.name).first()
+    if exists:
+        raise ConflictException("Category name already exists")
+    cat = TicketCategory(name=data.name, description=data.description, is_active=True)
+    db.add(cat)
+    db.commit()
+    db.refresh(cat)
+    return ResponseModel(data=CategoryOut.model_validate(cat), message="Category created")
+
+
+@router.get("", response_model=ResponseModel[list[CategoryOut]])
+def list_categories(active_only: bool = True, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    q = db.query(TicketCategory)
+    if active_only:
+        q = q.filter(TicketCategory.is_active == True)
+    cats = q.order_by(TicketCategory.name).all()
+    return ResponseModel(data=[CategoryOut.model_validate(c) for c in cats])
+
+
+@router.get("/{category_id}", response_model=ResponseModel[CategoryOut])
+def get_category(category_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    cat = db.query(TicketCategory).filter(TicketCategory.id == category_id).first()
+    if not cat:
+        raise NotFoundException("Category not found")
+    return ResponseModel(data=CategoryOut.model_validate(cat))
+
+
+@router.patch("/{category_id}", response_model=ResponseModel[CategoryOut])
+def update_category(category_id: int, data: CategoryUpdate, admin: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+    cat = db.query(TicketCategory).filter(TicketCategory.id == category_id).first()
+    if not cat:
+        raise NotFoundException("Category not found")
+    if data.name is not None:
+        cat.name = data.name
+    if data.description is not None:
+        cat.description = data.description
+    if data.is_active is not None:
+        cat.is_active = data.is_active
+    db.commit()
+    db.refresh(cat)
+    return ResponseModel(data=CategoryOut.model_validate(cat), message="Category updated")
+
+
+@router.post("/{category_id}/activate", response_model=ResponseModel[CategoryOut])
+def activate_category(category_id: int, admin: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+    cat = db.query(TicketCategory).filter(TicketCategory.id == category_id).first()
+    if not cat:
+        raise NotFoundException("Category not found")
+    cat.is_active = True
+    db.commit()
+    db.refresh(cat)
+    return ResponseModel(data=CategoryOut.model_validate(cat), message="Category activated")
+
+
+@router.post("/{category_id}/deactivate", response_model=ResponseModel[CategoryOut])
+def deactivate_category(category_id: int, admin: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+    cat = db.query(TicketCategory).filter(TicketCategory.id == category_id).first()
+    if not cat:
+        raise NotFoundException("Category not found")
+    cat.is_active = False
+    db.commit()
+    db.refresh(cat)
+    return ResponseModel(data=CategoryOut.model_validate(cat), message="Category deactivated")
+
+
+
+========================================
+FILE: .\app\api\v1\notifications.py
+========================================
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+from app.api.deps import get_current_user
+from app.models.user import User
+from app.models.notification import Notification
+from app.schemas.ticket import NotificationOut
+from app.schemas.common import ResponseModel, PaginatedResponse, PaginationMeta
+
+router = APIRouter()
+
+
+@router.get("", response_model=PaginatedResponse[NotificationOut])
+def get_notifications(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    unread_only: bool = False,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(Notification).filter(Notification.user_id == current_user.id)
+    if unread_only:
+        q = q.filter(Notification.is_read == False)
+    total = q.count()
+    items = q.order_by(Notification.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    return PaginatedResponse(
+        data=[NotificationOut.model_validate(n) for n in items],
+        meta=PaginationMeta(page=page, page_size=page_size, total=total, total_pages=(total + page_size - 1) // page_size or 1),
+    )
+
+
+@router.post("/{notification_id}/read", response_model=ResponseModel)
+def mark_as_read(notification_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    n = db.query(Notification).filter(Notification.id == notification_id, Notification.user_id == current_user.id).first()
+    if n:
+        n.is_read = True
+        db.commit()
+    return ResponseModel(message="Marked as read")
+
+
+@router.post("/read-all", response_model=ResponseModel)
+def mark_all_as_read(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    db.query(Notification).filter(
+        Notification.user_id == current_user.id, Notification.is_read == False
+    ).update({"is_read": True})
+    db.commit()
+    return ResponseModel(message="All notifications marked as read")
+
+
+
+========================================
+FILE: .\app\api\v1\dashboard.py
+========================================
+from datetime import datetime, timezone
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from app.core.database import get_db
+from app.api.deps import get_current_user
+from app.models.user import User
+from app.models.ticket import Ticket
+from app.models.enums import UserRole, UserStatus, TicketStatus, TicketPriority
+from app.schemas.ticket import DashboardStats
+from app.schemas.common import ResponseModel
+
+router = APIRouter()
+
+
+@router.get("/stats", response_model=ResponseModel[DashboardStats])
+def get_dashboard_stats(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    now = datetime.now(timezone.utc)
+    base = db.query(Ticket)
+    if current_user.role == UserRole.CUSTOMER:
+        base = base.filter(Ticket.customer_id == current_user.id)
+    elif current_user.role == UserRole.AGENT:
+        base = base.filter(Ticket.assigned_agent_id == current_user.id)
+
+    total = base.count()
+    open_c = base.filter(Ticket.status == TicketStatus.OPEN).count()
+    in_prog = base.filter(Ticket.status == TicketStatus.IN_PROGRESS).count()
+    resolved = base.filter(Ticket.status == TicketStatus.RESOLVED).count()
+    closed = base.filter(Ticket.status == TicketStatus.CLOSED).count()
+    overdue = base.filter(
+        Ticket.due_date < now,
+        Ticket.status.in_([TicketStatus.OPEN, TicketStatus.IN_PROGRESS]),
+    ).count()
+    critical = base.filter(Ticket.priority == TicketPriority.CRITICAL).count()
+
+    stats = DashboardStats(
+        total_tickets=total,
+        open_tickets=open_c,
+        in_progress_tickets=in_prog,
+        resolved_tickets=resolved,
+        closed_tickets=closed,
+        overdue_tickets=overdue,
+        critical_tickets=critical,
+    )
+
+    if current_user.role == UserRole.ADMIN:
+        stats.total_customers = db.query(User).filter(User.role == UserRole.CUSTOMER).count()
+        stats.total_agents = db.query(User).filter(User.role == UserRole.AGENT).count()
+        stats.active_agents = db.query(User).filter(
+            User.role == UserRole.AGENT, User.is_active == True, User.status == UserStatus.ACTIVE
+        ).count()
+    elif current_user.role == UserRole.AGENT:
+        my_base = db.query(Ticket).filter(Ticket.assigned_agent_id == current_user.id)
+        stats.my_open_tickets = my_base.filter(Ticket.status.in_([TicketStatus.OPEN, TicketStatus.IN_PROGRESS])).count()
+        stats.my_overdue_tickets = my_base.filter(
+            Ticket.due_date < now, Ticket.status.in_([TicketStatus.OPEN, TicketStatus.IN_PROGRESS])
+        ).count()
+        stats.my_resolved_tickets = my_base.filter(Ticket.status == TicketStatus.RESOLVED).count()
+
+    return ResponseModel(data=stats)
+
+
+
+========================================
+FILE: .\app\api\v1\audit.py
+========================================
+from typing import Optional
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+from app.api.deps import get_admin_user
+from app.models.user import User
+from app.models.audit import AuditLog
+from pydantic import BaseModel, ConfigDict
+from datetime import datetime
+from app.schemas.common import PaginatedResponse, PaginationMeta
+
+router = APIRouter()
+
+
+class AuditOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    user_id: Optional[int]
+    action: str
+    entity: str
+    entity_id: Optional[int]
+    ip_address: Optional[str]
+    created_at: datetime
+
+
+@router.get("", response_model=PaginatedResponse[AuditOut])
+def list_audit_logs(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    action: Optional[str] = None,
+    entity: Optional[str] = None,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(AuditLog)
+    if action:
+        q = q.filter(AuditLog.action == action)
+    if entity:
+        q = q.filter(AuditLog.entity == entity)
+    total = q.count()
+    items = q.order_by(AuditLog.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    return PaginatedResponse(
+        data=[AuditOut.model_validate(a) for a in items],
+        meta=PaginationMeta(page=page, page_size=page_size, total=total, total_pages=(total + page_size - 1) // page_size or 1),
+    )
+
+
+
+========================================
+FILE: .\app\core\config.py
+========================================
+from functools import lru_cache
+from typing import List
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    APP_NAME: str = "Support Ticket Management System"
+    APP_VERSION: str = "1.0.0"
+    DEBUG: bool = True
+    ENVIRONMENT: str = "development"
+    API_V1_PREFIX: str = "/api/v1"
+
+    SECRET_KEY: str = "change-me-in-production-use-a-long-random-string"
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+
+    DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/support_tickets"
+
+    REDIS_URL: str = "redis://localhost:6379/0"
+
+    UPLOAD_DIR: str = "./uploads"
+    MAX_UPLOAD_SIZE_MB: int = 10
+    ALLOWED_EXTENSIONS: str = "pdf,png,jpg,jpeg,gif,txt,doc,docx,xls,xlsx,zip"
+    ALLOWED_MIME_TYPES: str = (
+        "application/pdf,image/png,image/jpeg,image/gif,text/plain,"
+        "application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,"
+        "application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,"
+        "application/zip"
+    )
+
+    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173"
+
+    DEFAULT_PAGE_SIZE: int = 20
+    MAX_PAGE_SIZE: int = 100
+
+    @property
+    def cors_origins_list(self) -> List[str]:
+        return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+
+    @property
+    def allowed_extensions_list(self) -> List[str]:
+        return [ext.strip().lower() for ext in self.ALLOWED_EXTENSIONS.split(",") if ext.strip()]
+
+    @property
+    def allowed_mime_types_list(self) -> List[str]:
+        return [mime.strip().lower() for mime in self.ALLOWED_MIME_TYPES.split(",") if mime.strip()]
+
+    @property
+    def max_upload_size_bytes(self) -> int:
+        return self.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+
+
+@lru_cache()
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()
+
+
+
+========================================
+FILE: .\app\core\database.py
+========================================
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
+from app.core.config import settings
+
+engine = create_engine(
+    settings.DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=20,
+)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+
+========================================
+FILE: .\app\core\security.py
+========================================
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from app.core.config import settings
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def create_access_token(subject: str | int, expires_delta: Optional[timedelta] = None, extra_claims: dict | None = None) -> str:
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode: dict[str, Any] = {"sub": str(subject), "exp": expire, "type": "access"}
+    if extra_claims:
+        to_encode.update(extra_claims)
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def create_refresh_token(subject: str | int, expires_delta: Optional[timedelta] = None) -> str:
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode = {"sub": str(subject), "exp": expire, "type": "refresh"}
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def decode_token(token: str) -> dict | None:
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        return payload
+    except JWTError:
+        return None
+
+
+
+========================================
+FILE: .\app\core\exceptions.py
+========================================
+from fastapi import HTTPException, status
+
+
+class AppException(Exception):
+    def __init__(self, code: str, message: str, status_code: int = 400):
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+        super().__init__(message)
+
+
+class NotFoundException(AppException):
+    def __init__(self, message: str = "Resource not found", code: str = "NOT_FOUND"):
+        super().__init__(code=code, message=message, status_code=status.HTTP_404_NOT_FOUND)
+
+
+class UnauthorizedException(AppException):
+    def __init__(self, message: str = "Unauthorized", code: str = "UNAUTHORIZED"):
+        super().__init__(code=code, message=message, status_code=status.HTTP_401_UNAUTHORIZED)
+
+
+class ForbiddenException(AppException):
+    def __init__(self, message: str = "Forbidden", code: str = "FORBIDDEN"):
+        super().__init__(code=code, message=message, status_code=status.HTTP_403_FORBIDDEN)
+
+
+class ConflictException(AppException):
+    def __init__(self, message: str = "Conflict", code: str = "CONFLICT"):
+        super().__init__(code=code, message=message, status_code=status.HTTP_409_CONFLICT)
+
+
+class ValidationException(AppException):
+    def __init__(self, message: str = "Validation error", code: str = "VALIDATION_ERROR"):
+        super().__init__(code=code, message=message, status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+
+class InvalidStatusTransition(AppException):
+    def __init__(self, message: str = "Invalid status transition"):
+        super().__init__(code="INVALID_STATUS_TRANSITION", message=message, status_code=status.HTTP_400_BAD_REQUEST)
+
+
+
+========================================
+FILE: .\app\models\user.py
+========================================
+from datetime import datetime, timezone
+from sqlalchemy import String, Boolean, DateTime, Enum as SAEnum, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.core.database import Base
+from app.models.enums import UserRole, UserStatus
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    full_name: Mapped[str] = mapped_column(String(150), nullable=False)
+    role: Mapped[UserRole] = mapped_column(SAEnum(UserRole), default=UserRole.CUSTOMER, nullable=False, index=True)
+    status: Mapped[UserStatus] = mapped_column(SAEnum(UserStatus), default=UserStatus.ACTIVE, nullable=False, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    # Relationships
+    tickets_created = relationship("Ticket", back_populates="customer", foreign_keys="Ticket.customer_id")
+    tickets_assigned = relationship("Ticket", back_populates="assigned_agent", foreign_keys="Ticket.assigned_agent_id")
+    comments = relationship("TicketComment", back_populates="user")
+    attachments = relationship("TicketAttachment", back_populates="uploaded_by_user")
+    notifications = relationship("Notification", back_populates="user")
+    refresh_tokens = relationship("RefreshToken", back_populates="user", cascade="all, delete-orphan")
+    audit_logs = relationship("AuditLog", back_populates="user")
+
+    def __repr__(self) -> str:
+        return f"<User id={self.id} email={self.email} role={self.role}>"
+
+
+
+========================================
+FILE: .\app\models\ticket.py
+========================================
+from datetime import datetime, timezone
+from sqlalchemy import String, Text, DateTime, ForeignKey, Enum as SAEnum, Index
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.core.database import Base
+from app.models.enums import TicketStatus, TicketPriority
+
+
+class Ticket(Base):
+    __tablename__ = "tickets"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    ticket_number: Mapped[str] = mapped_column(String(30), unique=True, nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[TicketStatus] = mapped_column(
+        SAEnum(TicketStatus), default=TicketStatus.OPEN, nullable=False, index=True
+    )
+    priority: Mapped[TicketPriority] = mapped_column(
+        SAEnum(TicketPriority), default=TicketPriority.MEDIUM, nullable=False, index=True
+    )
+
+    customer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    assigned_agent_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    category_id: Mapped[int] = mapped_column(ForeignKey("ticket_categories.id"), nullable=False, index=True)
+
+    due_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Relationships
+    customer = relationship("User", back_populates="tickets_created", foreign_keys=[customer_id])
+    assigned_agent = relationship("User", back_populates="tickets_assigned", foreign_keys=[assigned_agent_id])
+    category = relationship("TicketCategory", back_populates="tickets")
+    comments = relationship("TicketComment", back_populates="ticket", cascade="all, delete-orphan")
+    attachments = relationship("TicketAttachment", back_populates="ticket", cascade="all, delete-orphan")
+    status_history = relationship("TicketStatusHistory", back_populates="ticket", cascade="all, delete-orphan")
+    notifications = relationship("Notification", back_populates="ticket")
+
+    __table_args__ = (
+        Index("ix_tickets_status_priority", "status", "priority"),
+        Index("ix_tickets_customer_status", "customer_id", "status"),
+        Index("ix_tickets_agent_status", "assigned_agent_id", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Ticket id={self.id} number={self.ticket_number} status={self.status}>"
+
+
+class TicketStatusHistory(Base):
+    __tablename__ = "ticket_status_history"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id", ondelete="CASCADE"), nullable=False, index=True)
+    old_status: Mapped[TicketStatus | None] = mapped_column(SAEnum(TicketStatus), nullable=True)
+    new_status: Mapped[TicketStatus] = mapped_column(SAEnum(TicketStatus), nullable=False)
+    changed_by_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    ticket = relationship("Ticket", back_populates="status_history")
+    changed_by = relationship("User")
+
+
+
+========================================
+FILE: .\app\models\comment.py
+========================================
+from datetime import datetime, timezone
+from sqlalchemy import Text, DateTime, ForeignKey, Boolean
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.core.database import Base
+
+
+class TicketComment(Base):
+    __tablename__ = "ticket_comments"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    is_internal: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)  # internal notes for agents
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    ticket = relationship("Ticket", back_populates="comments")
+    user = relationship("User", back_populates="comments")
+
+
+
+========================================
+FILE: .\app\models\attachment.py
+========================================
+from datetime import datetime, timezone
+from sqlalchemy import String, Integer, DateTime, ForeignKey, BigInteger
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.core.database import Base
+
+
+class TicketAttachment(Base):
+    __tablename__ = "ticket_attachments"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id", ondelete="CASCADE"), nullable=False, index=True)
+    uploaded_by_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    original_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(150), nullable=False)
+    file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    storage_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    ticket = relationship("Ticket", back_populates="attachments")
+    uploaded_by_user = relationship("User", back_populates="attachments")
+
+
+
+========================================
+FILE: .\app\models\category.py
+========================================
+from datetime import datetime, timezone
+from sqlalchemy import String, Boolean, DateTime, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.core.database import Base
+
+
+class TicketCategory(Base):
+    __tablename__ = "ticket_categories"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    tickets = relationship("Ticket", back_populates="category")
+
+    def __repr__(self) -> str:
+        return f"<TicketCategory id={self.id} name={self.name}>"
+
+
+
+========================================
+FILE: .\app\models\notification.py
+========================================
+from datetime import datetime, timezone
+from sqlalchemy import String, Text, DateTime, ForeignKey, Boolean, Enum as SAEnum
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.core.database import Base
+import enum
+
+
+class NotificationType(str, enum.Enum):
+    TICKET_CREATED = "ticket_created"
+    TICKET_ASSIGNED = "ticket_assigned"
+    TICKET_REASSIGNED = "ticket_reassigned"
+    TICKET_STATUS_CHANGED = "ticket_status_changed"
+    NEW_COMMENT = "new_comment"
+    TICKET_RESOLVED = "ticket_resolved"
+    TICKET_CLOSED = "ticket_closed"
+    SLA_BREACHED = "sla_breached"
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    ticket_id: Mapped[int | None] = mapped_column(ForeignKey("tickets.id", ondelete="SET NULL"), nullable=True, index=True)
+    type: Mapped[NotificationType] = mapped_column(SAEnum(NotificationType), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+    user = relationship("User", back_populates="notifications")
+    ticket = relationship("Ticket", back_populates="notifications")
+
+
+
+========================================
+FILE: .\app\models\audit.py
+========================================
+from datetime import datetime, timezone
+from sqlalchemy import String, Text, DateTime, ForeignKey, Integer, JSON
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.core.database import Base
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    action: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    entity: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    entity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    metadata_: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+    user = relationship("User", back_populates="audit_logs")
+
+
+
+========================================
+FILE: .\app\models\refresh_token.py
+========================================
+from datetime import datetime, timezone
+from sqlalchemy import String, DateTime, ForeignKey, Boolean
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.core.database import Base
+
+
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    token: Mapped[str] = mapped_column(String(500), unique=True, nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    is_revoked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User", back_populates="refresh_tokens")
+
+
+
+========================================
+FILE: .\app\models\enums.py
+========================================
+import enum
+
+
+class UserRole(str, enum.Enum):
+    ADMIN = "admin"
+    AGENT = "agent"
+    CUSTOMER = "customer"
+
+
+class UserStatus(str, enum.Enum):
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+
+
+class TicketStatus(str, enum.Enum):
+    OPEN = "open"
+    IN_PROGRESS = "in_progress"
+    RESOLVED = "resolved"
+    CLOSED = "closed"
+
+
+class TicketPriority(str, enum.Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+# Valid status transitions
+STATUS_TRANSITIONS = {
+    TicketStatus.OPEN: [TicketStatus.IN_PROGRESS, TicketStatus.CLOSED],
+    TicketStatus.IN_PROGRESS: [TicketStatus.RESOLVED, TicketStatus.OPEN, TicketStatus.CLOSED],
+    TicketStatus.RESOLVED: [TicketStatus.CLOSED, TicketStatus.OPEN, TicketStatus.IN_PROGRESS],
+    TicketStatus.CLOSED: [TicketStatus.OPEN],  # reopen only
+}
+
+
+# SLA hours by priority
+SLA_HOURS = {
+    TicketPriority.LOW: 72,
+    TicketPriority.MEDIUM: 48,
+    TicketPriority.HIGH: 24,
+    TicketPriority.CRITICAL: 4,
+}
+
+
+
+========================================
+FILE: .\app\schemas\user.py
+========================================
+from datetime import datetime
+from typing import Optional
+from pydantic import BaseModel, EmailStr, Field, ConfigDict
+from app.models.enums import UserRole, UserStatus
+
+
+class UserBase(BaseModel):
+    email: EmailStr
+    full_name: str = Field(..., min_length=2, max_length=150)
+
+
+class UserCreate(UserBase):
+    password: str = Field(..., min_length=8, max_length=128)
+    role: UserRole = UserRole.CUSTOMER
+
+
+class UserRegister(BaseModel):
+    email: EmailStr
+    full_name: str = Field(..., min_length=2, max_length=150)
+    password: str = Field(..., min_length=8, max_length=128)
+
+
+class UserUpdate(BaseModel):
+    full_name: Optional[str] = Field(None, min_length=2, max_length=150)
+    email: Optional[EmailStr] = None
+    role: Optional[UserRole] = None
+    status: Optional[UserStatus] = None
+
+
+class UserChangePassword(BaseModel):
+    current_password: str
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email: EmailStr
+    full_name: str
+    role: UserRole
+    status: UserStatus
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class Token(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+
+class TokenRefresh(BaseModel):
+    refresh_token: str
+
+
+class TokenPayload(BaseModel):
+    sub: str
+    type: str
+    exp: int
+
+
+
+========================================
+FILE: .\app\schemas\ticket.py
+========================================
+from datetime import datetime
+from typing import Optional, List
+from pydantic import BaseModel, Field, ConfigDict
+from app.models.enums import TicketStatus, TicketPriority
+from app.schemas.user import UserOut
+
+
+class CategoryBase(BaseModel):
+    name: str = Field(..., min_length=2, max_length=100)
+    description: Optional[str] = None
+
+
+class CategoryCreate(CategoryBase):
+    pass
+
+
+class CategoryUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=2, max_length=100)
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class CategoryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    description: Optional[str]
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class TicketCreate(BaseModel):
+    title: str = Field(..., min_length=5, max_length=255)
+    description: str = Field(..., min_length=10)
+    category_id: int
+    priority: TicketPriority = TicketPriority.MEDIUM
+
+
+class TicketUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=5, max_length=255)
+    description: Optional[str] = Field(None, min_length=10)
+    category_id: Optional[int] = None
+    priority: Optional[TicketPriority] = None
+    status: Optional[TicketStatus] = None
+
+
+class TicketAssign(BaseModel):
+    agent_id: int
+
+
+class TicketStatusUpdate(BaseModel):
+    status: TicketStatus
+    note: Optional[str] = None
+
+
+class TicketOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    ticket_number: str
+    title: str
+    description: str
+    status: TicketStatus
+    priority: TicketPriority
+    customer_id: int
+    assigned_agent_id: Optional[int]
+    category_id: int
+    due_date: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+    resolved_at: Optional[datetime]
+    closed_at: Optional[datetime]
+    customer: Optional[UserOut] = None
+    assigned_agent: Optional[UserOut] = None
+    category: Optional[CategoryOut] = None
+
+
+class TicketListOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    ticket_number: str
+    title: str
+    status: TicketStatus
+    priority: TicketPriority
+    customer_id: int
+    assigned_agent_id: Optional[int]
+    category_id: int
+    due_date: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+
+
+class CommentCreate(BaseModel):
+    message: str = Field(..., min_length=1, max_length=5000)
+    is_internal: bool = False
+
+
+class CommentUpdate(BaseModel):
+    message: str = Field(..., min_length=1, max_length=5000)
+
+
+class CommentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    ticket_id: int
+    user_id: int
+    message: str
+    is_internal: bool
+    created_at: datetime
+    updated_at: datetime
+    user: Optional[UserOut] = None
+
+
+class AttachmentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    ticket_id: int
+    uploaded_by_id: int
+    file_name: str
+    original_name: str
+    file_type: str
+    mime_type: str
+    file_size: int
+    created_at: datetime
+
+
+class NotificationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    ticket_id: Optional[int]
+    type: str
+    title: str
+    message: str
+    is_read: bool
+    created_at: datetime
+
+
+class DashboardStats(BaseModel):
+    total_tickets: int = 0
+    open_tickets: int = 0
+    in_progress_tickets: int = 0
+    resolved_tickets: int = 0
+    closed_tickets: int = 0
+    overdue_tickets: int = 0
+    critical_tickets: int = 0
+    # Admin extras
+    total_customers: Optional[int] = None
+    total_agents: Optional[int] = None
+    active_agents: Optional[int] = None
+    # Agent extras
+    my_open_tickets: Optional[int] = None
+    my_overdue_tickets: Optional[int] = None
+    my_resolved_tickets: Optional[int] = None
+
+
+
+========================================
+FILE: .\app\schemas\common.py
+========================================
+from typing import Generic, TypeVar, List, Optional, Any
+from pydantic import BaseModel, Field
+
+T = TypeVar("T")
+
+
+class ResponseModel(BaseModel, Generic[T]):
+    success: bool = True
+    data: Optional[T] = None
+    message: Optional[str] = None
+
+
+class ErrorDetail(BaseModel):
+    code: str
+    message: str
+
+
+class ErrorResponse(BaseModel):
+    success: bool = False
+    error: ErrorDetail
+
+
+class PaginationMeta(BaseModel):
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
+
+
+class PaginatedResponse(BaseModel, Generic[T]):
+    success: bool = True
+    data: List[T]
+    meta: PaginationMeta
+
+
+
+========================================
+FILE: .\app\repositories\user.py
+========================================
+from typing import Optional, List
+from sqlalchemy.orm import Session
+from sqlalchemy import or_
+from app.models.user import User
+from app.models.enums import UserRole, UserStatus
+
+
+class UserRepository:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def get_by_id(self, user_id: int) -> Optional[User]:
+        return self.db.query(User).filter(User.id == user_id).first()
+
+    def get_by_email(self, email: str) -> Optional[User]:
+        return self.db.query(User).filter(User.email == email.lower()).first()
+
+    def create(self, user: User) -> User:
+        self.db.add(user)
+        self.db.commit()
+        self.db.refresh(user)
+        return user
+
+    def update(self, user: User) -> User:
+        self.db.commit()
+        self.db.refresh(user)
+        return user
+
+    def list_users(
+        self,
+        skip: int = 0,
+        limit: int = 20,
+        role: Optional[UserRole] = None,
+        status: Optional[UserStatus] = None,
+        search: Optional[str] = None,
+    ) -> tuple[List[User], int]:
+        q = self.db.query(User)
+        if role:
+            q = q.filter(User.role == role)
+        if status:
+            q = q.filter(User.status == status)
+        if search:
+            like = f"%{search}%"
+            q = q.filter(or_(User.email.ilike(like), User.full_name.ilike(like)))
+        total = q.count()
+        users = q.order_by(User.created_at.desc()).offset(skip).limit(limit).all()
+        return users, total
+
+    def count_by_role(self, role: UserRole, active_only: bool = False) -> int:
+        q = self.db.query(User).filter(User.role == role)
+        if active_only:
+            q = q.filter(User.is_active == True, User.status == UserStatus.ACTIVE)
+        return q.count()
+
+
+
+========================================
+FILE: .\alembic\env.py
+========================================
+from logging.config import fileConfig
+from sqlalchemy import engine_from_config, pool
+from alembic import context
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from app.core.config import settings
+from app.core.database import Base
+from app.models import *  # noqa
+
+config = context.config
+config.set_main_option(
+    "sqlalchemy.url",
+    settings.DATABASE_URL.replace("%", "%%")
+)
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+target_metadata = Base.metadata
+
+
+def run_migrations_offline() -> None:
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+
+
+
+========================================
+FILE: .\alembic\versions\001_initial.py
+========================================
+"""initial schema
+
+Revision ID: 001
+Revises:
+Create Date: 2026-09-21
+"""
+from typing import Sequence, Union
+from alembic import op
+import sqlalchemy as sa
+
+revision: str = "001"
+down_revision: Union[str, None] = None
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "users",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("email", sa.String(length=255), nullable=False),
+        sa.Column("hashed_password", sa.String(length=255), nullable=False),
+        sa.Column("full_name", sa.String(length=150), nullable=False),
+        sa.Column("role", sa.Enum("admin", "agent", "customer", name="userrole"), nullable=False),
+        sa.Column("status", sa.Enum("active", "inactive", name="userstatus"), nullable=False),
+        sa.Column("is_active", sa.Boolean(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("ix_users_email", "users", ["email"], unique=True)
+    op.create_index("ix_users_id", "users", ["id"])
+    op.create_index("ix_users_role", "users", ["role"])
+    op.create_index("ix_users_status", "users", ["status"])
+
+    op.create_table(
+        "ticket_categories",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("name", sa.String(length=100), nullable=False),
+        sa.Column("description", sa.Text(), nullable=True),
+        sa.Column("is_active", sa.Boolean(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("ix_ticket_categories_id", "ticket_categories", ["id"])
+    op.create_index("ix_ticket_categories_name", "ticket_categories", ["name"], unique=True)
+    op.create_index("ix_ticket_categories_is_active", "ticket_categories", ["is_active"])
+
+    op.create_table(
+        "tickets",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("ticket_number", sa.String(length=30), nullable=False),
+        sa.Column("title", sa.String(length=255), nullable=False),
+        sa.Column("description", sa.Text(), nullable=False),
+        sa.Column("status", sa.Enum("open", "in_progress", "resolved", "closed", name="ticketstatus"), nullable=False),
+        sa.Column("priority", sa.Enum("low", "medium", "high", "critical", name="ticketpriority"), nullable=False),
+        sa.Column("customer_id", sa.Integer(), nullable=False),
+        sa.Column("assigned_agent_id", sa.Integer(), nullable=True),
+        sa.Column("category_id", sa.Integer(), nullable=False),
+        sa.Column("due_date", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("resolved_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("closed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.ForeignKeyConstraint(["assigned_agent_id"], ["users.id"]),
+        sa.ForeignKeyConstraint(["category_id"], ["ticket_categories.id"]),
+        sa.ForeignKeyConstraint(["customer_id"], ["users.id"]),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("ix_tickets_ticket_number", "tickets", ["ticket_number"], unique=True)
+    op.create_index("ix_tickets_status", "tickets", ["status"])
+    op.create_index("ix_tickets_priority", "tickets", ["priority"])
+    op.create_index("ix_tickets_customer_id", "tickets", ["customer_id"])
+    op.create_index("ix_tickets_assigned_agent_id", "tickets", ["assigned_agent_id"])
+    op.create_index("ix_tickets_category_id", "tickets", ["category_id"])
+    op.create_index("ix_tickets_due_date", "tickets", ["due_date"])
+    op.create_index("ix_tickets_created_at", "tickets", ["created_at"])
+
+    op.create_table(
+        "ticket_comments",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("ticket_id", sa.Integer(), nullable=False),
+        sa.Column("user_id", sa.Integer(), nullable=False),
+        sa.Column("message", sa.Text(), nullable=False),
+        sa.Column("is_internal", sa.Boolean(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),
+        sa.ForeignKeyConstraint(["ticket_id"], ["tickets.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["user_id"], ["users.id"]),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("ix_ticket_comments_ticket_id", "ticket_comments", ["ticket_id"])
+    op.create_index("ix_ticket_comments_user_id", "ticket_comments", ["user_id"])
+
+    op.create_table(
+        "ticket_attachments",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("ticket_id", sa.Integer(), nullable=False),
+        sa.Column("uploaded_by_id", sa.Integer(), nullable=False),
+        sa.Column("file_name", sa.String(length=255), nullable=False),
+        sa.Column("original_name", sa.String(length=255), nullable=False),
+        sa.Column("file_type", sa.String(length=100), nullable=False),
+        sa.Column("mime_type", sa.String(length=150), nullable=False),
+        sa.Column("file_size", sa.BigInteger(), nullable=False),
+        sa.Column("storage_path", sa.String(length=500), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
+        sa.ForeignKeyConstraint(["ticket_id"], ["tickets.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["uploaded_by_id"], ["users.id"]),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("ix_ticket_attachments_ticket_id", "ticket_attachments", ["ticket_id"])
+
+    op.create_table(
+        "ticket_status_history",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("ticket_id", sa.Integer(), nullable=False),
+        sa.Column("old_status", sa.Enum("open", "in_progress", "resolved", "closed", name="ticketstatus", create_type=False), nullable=True),
+        sa.Column("new_status", sa.Enum("open", "in_progress", "resolved", "closed", name="ticketstatus", create_type=False), nullable=False),
+        sa.Column("changed_by_id", sa.Integer(), nullable=False),
+        sa.Column("note", sa.Text(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
+        sa.ForeignKeyConstraint(["changed_by_id"], ["users.id"]),
+        sa.ForeignKeyConstraint(["ticket_id"], ["tickets.id"], ondelete="CASCADE"),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("ix_ticket_status_history_ticket_id", "ticket_status_history", ["ticket_id"])
+
+    op.create_table(
+        "notifications",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("user_id", sa.Integer(), nullable=False),
+        sa.Column("ticket_id", sa.Integer(), nullable=True),
+        sa.Column("type", sa.Enum("ticket_created", "ticket_assigned", "ticket_reassigned", "ticket_status_changed", "new_comment", "ticket_resolved", "ticket_closed", "sla_breached", name="notificationtype"), nullable=False),
+        sa.Column("title", sa.String(length=255), nullable=False),
+        sa.Column("message", sa.Text(), nullable=False),
+        sa.Column("is_read", sa.Boolean(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
+        sa.ForeignKeyConstraint(["ticket_id"], ["tickets.id"], ondelete="SET NULL"),
+        sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("ix_notifications_user_id", "notifications", ["user_id"])
+    op.create_index("ix_notifications_is_read", "notifications", ["is_read"])
+
+    op.create_table(
+        "audit_logs",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("user_id", sa.Integer(), nullable=True),
+        sa.Column("action", sa.String(length=100), nullable=False),
+        sa.Column("entity", sa.String(length=50), nullable=False),
+        sa.Column("entity_id", sa.Integer(), nullable=True),
+        sa.Column("ip_address", sa.String(length=45), nullable=True),
+        sa.Column("metadata", sa.JSON(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
+        sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="SET NULL"),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("ix_audit_logs_action", "audit_logs", ["action"])
+    op.create_index("ix_audit_logs_created_at", "audit_logs", ["created_at"])
+
+    op.create_table(
+        "refresh_tokens",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("user_id", sa.Integer(), nullable=False),
+        sa.Column("token", sa.String(length=500), nullable=False),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("is_revoked", sa.Boolean(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
+        sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("ix_refresh_tokens_token", "refresh_tokens", ["token"], unique=True)
+
+
+def downgrade() -> None:
+    op.drop_table("refresh_tokens")
+    op.drop_table("audit_logs")
+    op.drop_table("notifications")
+    op.drop_table("ticket_status_history")
+    op.drop_table("ticket_attachments")
+    op.drop_table("ticket_comments")
+    op.drop_table("tickets")
+    op.drop_table("ticket_categories")
+    op.drop_table("users")
+    op.execute("DROP TYPE IF EXISTS notificationtype")
+    op.execute("DROP TYPE IF EXISTS ticketpriority")
+    op.execute("DROP TYPE IF EXISTS ticketstatus")
+    op.execute("DROP TYPE IF EXISTS userstatus")
+    op.execute("DROP TYPE IF EXISTS userrole")
+
+
+
+========================================
+FILE: .\tests\test_auth.py
+========================================
+"""Basic authentication tests (run with pytest against a test DB)."""
+import pytest
+from fastapi.testclient import TestClient
+from app.main import app
+
+client = TestClient(app)
+
+
+def test_health():
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json()["status"] == "healthy"
+
+
+def test_register_and_login():
+    # This test assumes a running DB; skip if not available
+    email = "testuser@example.com"
+    r = client.post("/api/v1/auth/register", json={
+        "email": email,
+        "full_name": "Test User",
+        "password": "TestPass123!",
+    })
+    # May conflict if already exists
+    if r.status_code in (201, 409):
+        r = client.post("/api/v1/auth/login", json={
+            "email": email,
+            "password": "TestPass123!",
+        })
+        if r.status_code == 200:
+            data = r.json()
+            assert data["success"] is True
+            assert "access_token" in data["data"]
+            assert "refresh_token" in data["data"]
+
+
+
+========================================
+FILE: .\requirements.txt
+========================================
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+sqlalchemy==2.0.35
+alembic==1.13.3
+psycopg2-binary==2.9.9
+pydantic==2.9.2
+pydantic-settings==2.5.2
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+python-multipart==0.0.12
+email-validator==2.2.0
+httpx==0.27.2
+pytest==8.3.3
+pytest-asyncio==0.24.0
+pytest-cov==5.0.0
+aiosqlite==0.20.0
+python-dotenv==1.0.1
+aiofiles==24.1.0
+Pillow==10.4.0
+redis==5.1.0
+celery==5.4.0
+gunicorn==22.0.0
+
+
+FILE NOT FOUND: .\README.md
+
+
+========================================
+FILE: .\.env.example
+========================================
+# Application
+APP_NAME=Support Ticket Management System
+APP_VERSION=1.0.0
+DEBUG=True
+ENVIRONMENT=development
+API_V1_PREFIX=/api/v1
+
+# Security
+SECRET_KEY=your-super-secret-key-change-this-in-production-min-32-chars
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=30
+REFRESH_TOKEN_EXPIRE_DAYS=7
+
+# Database
+DATABASE_URL=postgresql://postgres:postgres@db:5432/support_tickets
+# For local development without Docker:
+# DATABASE_URL=postgresql://postgres:postgres@localhost:5432/support_tickets
+
+# Redis (optional, for caching & Celery)
+REDIS_URL=redis://redis:6379/0
+
+# File Uploads
+UPLOAD_DIR=./uploads
+MAX_UPLOAD_SIZE_MB=10
+ALLOWED_EXTENSIONS=pdf,png,jpg,jpeg,gif,txt,doc,docx,xls,xlsx,zip
+ALLOWED_MIME_TYPES=application/pdf,image/png,image/jpeg,image/gif,text/plain,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/zip
+
+# CORS
+CORS_ORIGINS=http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173
+
+# Pagination
+DEFAULT_PAGE_SIZE=20
+MAX_PAGE_SIZE=100
+
+
+
+========== PYTHON COMPILE CHECK ==========
+Listing 'app'...
+Listing 'app\\api'...
+Listing 'app\\api\\v1'...
+Listing 'app\\core'...
+Listing 'app\\middleware'...
+Listing 'app\\models'...
+Listing 'app\\repositories'...
+Listing 'app\\schemas'...
+Listing 'app\\services'...
+Listing 'app\\utils'...
+
+
+========== PYTEST ==========
